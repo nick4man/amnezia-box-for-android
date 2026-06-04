@@ -1,0 +1,105 @@
+name: Build sing-box (Linux, AmneziaWG)
+
+# Cross-compiles the amnezia-box core (cmd/sing-box) for Linux with AmneziaWG.
+#
+# Self-contained: the core is checked out EXPLICITLY from core_repo
+# (default hoaxisr/amnezia-box), so it works regardless of which repo hosts this file.
+#
+# Reuses the core's own `make build` -> tags, version (git describe) and ldflags come
+# from the Makefile (TAGS already include with_awg). Pure-Go static build
+# (CGO_ENABLED=0); naive_outbound/cronet is omitted (it would need libcronet via CGO).
+
+on:
+  workflow_dispatch:
+    inputs:
+      core_repo:
+        description: 'amnezia-box core repo (must contain the Makefile + cmd/sing-box + include/awg.go)'
+        default: 'hoaxisr/amnezia-box'
+        required: true
+      core_ref:
+        description: 'core git ref (branch / tag / full 40-char SHA)'
+        default: 'main'
+        required: true
+      goarches:
+        description: 'Comma-separated Linux architectures (amd64, arm64, arm, 386, riscv64, ...)'
+        default: 'amd64,arm64'
+        required: true
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - id: set
+        run: |
+          arches="${{ github.event.inputs.goarches || 'amd64,arm64' }}"
+          json=$(printf '%s' "$arches" | tr ',' '\n' | sed '/^$/d' | jq -R . | jq -cs '{goarch: .}')
+          echo "matrix=$json" >> "$GITHUB_OUTPUT"
+          echo "matrix: $json"
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    env:
+      CORE_REPO: ${{ github.event.inputs.core_repo || 'hoaxisr/amnezia-box' }}
+      CORE_REF: ${{ github.event.inputs.core_ref || 'main' }}
+    steps:
+      - name: Checkout amnezia-box core
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.CORE_REPO }}
+          ref: ${{ env.CORE_REF }}
+          fetch-depth: 0          # Makefile derives VERSION from `git describe --tags`
+          submodules: recursive
+
+      - name: Sanity — this repo is the core
+        run: |
+          test -f Makefile && test -d cmd/sing-box || {
+            echo "::error::core_repo '${CORE_REPO}@${CORE_REF}' has no Makefile/cmd/sing-box — wrong repo?"; exit 1; }
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'    # >= 1.25 required by the badlinkname / -checklinkname=0 tags
+          cache-dependency-path: go.sum
+
+      - name: Build sing-box (with AmneziaWG)
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+        run: |
+          set -e
+          [ "$GOARCH" = "arm" ] && export GOARM=7   # 32-bit ARM -> ARMv7
+          make build                                # TAGS already include with_awg
+          test -f sing-box
+          ver=$(git describe --tags --always | sed 's/^v//')
+          out="sing-box-${ver}-linux-${GOARCH}"
+          mv sing-box "$out"
+          echo "OUT=$out" >> "$GITHUB_ENV"
+          echo "built $out"
+          file "$out" || true
+
+      - name: Verify AWG is compiled in
+        run: |
+          set -e
+          if strings -n 8 "$OUT" | grep -q "Awg is not included in this build"; then
+            echo "::error::AWG stub present — with_awg tag missing"; exit 1
+          fi
+          n=$(strings -n 6 "$OUT" | grep -ci 'amneziawg' || true)
+          echo "amneziawg references: $n"
+          [ "$n" -gt 0 ] || { echo "::error::no amneziawg symbols found"; exit 1; }
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: sing-box-linux-${{ matrix.goarch }}
+          path: ${{ env.OUT }}
+          if-no-files-found: error
