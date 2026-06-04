@@ -1,0 +1,85 @@
+name: Build sing-box (Windows, AmneziaWG)
+
+# Cross-compiles the amnezia-box core (cmd/sing-box) for Windows with AmneziaWG.
+# This workflow belongs in the CORE repo (amnezia-box), not the Android app repo.
+#
+# It reuses the repo's own `make build`, so build tags, version (git describe) and
+# ldflags come straight from the Makefile. Default TAGS already include with_awg.
+# Pure-Go cross build (CGO_ENABLED=0) — the naive_outbound/cronet tag is intentionally
+# NOT used here because it would require the native libcronet (CGO).
+
+on:
+  workflow_dispatch:
+    inputs:
+      goarches:
+        description: 'Comma-separated Windows architectures to build'
+        default: 'amd64,arm64'
+        required: true
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - id: set
+        run: |
+          arches="${{ github.event.inputs.goarches || 'amd64,arm64' }}"
+          json=$(printf '%s' "$arches" | tr ',' '\n' | sed '/^$/d' | \
+            jq -R . | jq -cs '{goarch: .}')
+          echo "matrix=$json" >> "$GITHUB_OUTPUT"
+          echo "matrix: $json"
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # Makefile derives VERSION from `git describe --tags`
+          submodules: recursive
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'    # >= 1.25 required by the badlinkname / -checklinkname=0 tags
+          cache-dependency-path: go.sum
+
+      - name: Build sing-box.exe (with AmneziaWG)
+        env:
+          GOOS: windows
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+        run: |
+          set -e
+          make build                       # TAGS already include with_awg
+          test -f sing-box.exe
+          ver=$(git describe --tags --always | sed 's/^v//')
+          out="sing-box-${ver}-windows-${GOARCH}.exe"
+          mv sing-box.exe "$out"
+          echo "OUT=$out" >> "$GITHUB_ENV"
+          echo "built $out"
+
+      - name: Verify AWG is compiled in
+        run: |
+          set -e
+          if strings -n 8 "$OUT" | grep -q "Awg is not included in this build"; then
+            echo "::error::AWG stub present — with_awg tag missing"; exit 1
+          fi
+          n=$(strings -n 6 "$OUT" | grep -ci 'amneziawg' || true)
+          echo "amneziawg references: $n"
+          [ "$n" -gt 0 ] || { echo "::error::no amneziawg symbols found"; exit 1; }
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: sing-box-windows-${{ matrix.goarch }}
+          path: ${{ env.OUT }}
+          if-no-files-found: error
