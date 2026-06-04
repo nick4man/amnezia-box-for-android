@@ -1,0 +1,113 @@
+name: Build SFA (AmneziaWG)
+
+# Builds the sing-box-for-android (SFA) APK using libbox built from THIS fork,
+# with AmneziaWG compiled in (-tags with_awg, already wired into cmd/internal/build_libbox).
+#
+# Pipeline (mirrors the local Makefile flow):
+#   1. build libbox.aar / libbox-legacy.aar from this repo via gomobile + NDK
+#   2. drop the AARs into sing-box-for-android/app/libs
+#   3. assemble the APK with Gradle
+#
+# SFA is pinned by commit to the release that matches this fork's sing-box version.
+# Default = ab09918615e3 ("Bump version 1.13.8"), matching v1.13.8-awg2.0.
+# Bump `sfa_ref` whenever you rebase the fork onto a newer sing-box.
+
+on:
+  workflow_dispatch:
+    inputs:
+      sfa_ref:
+        description: 'sing-box-for-android git ref (tag/branch/commit) matching this fork'
+        default: 'ab09918615e3'
+        required: true
+      gradle_task:
+        description: 'Gradle assemble task (e.g. assembleOtherDebug, assembleOtherRelease, assemblePlayRelease)'
+        default: 'assembleOtherDebug'
+        required: true
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      NDK_VERSION: '28.0.13004108'
+      SFA_REF: ${{ github.event.inputs.sfa_ref || 'ab09918615e3' }}
+      GRADLE_TASK: ${{ github.event.inputs.gradle_task || 'assembleOtherDebug' }}
+    steps:
+      - name: Checkout amnezia-box (this fork)
+        uses: actions/checkout@v4
+        with:
+          path: amnezia-box
+          fetch-depth: 0          # full history + tags: build_libbox uses `git describe --tags`
+          submodules: recursive
+
+      - name: Checkout sing-box-for-android
+        uses: actions/checkout@v4
+        with:
+          repository: SagerNet/sing-box-for-android
+          ref: ${{ env.SFA_REF }}
+          path: sing-box-for-android
+          submodules: recursive
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin   # `java --version` prints "openjdk 17..." -> passes checkJavaVersion()
+          java-version: '17'
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'    # >= 1.25 required by the badlinkname / -checklinkname=0 tags
+          cache-dependency-path: amnezia-box/go.sum
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install pinned NDK
+        run: sdkmanager --install "ndk;${NDK_VERSION}"
+        # build_shared.FindSDK() auto-detects $ANDROID_HOME/ndk/${NDK_VERSION}
+
+      - name: Install gomobile / gobind (SagerNet fork)
+        working-directory: amnezia-box
+        run: |
+          make lib_install
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Build libbox.aar (with AmneziaWG)
+        working-directory: amnezia-box
+        run: make lib_android
+        # produces libbox.aar (API 23) and libbox-legacy.aar (API 21), all ABIs
+
+      - name: Stage AARs into SFA
+        run: |
+          mkdir -p sing-box-for-android/app/libs
+          cp amnezia-box/libbox.aar        sing-box-for-android/app/libs/
+          cp amnezia-box/libbox-legacy.aar sing-box-for-android/app/libs/
+          ls -lh sing-box-for-android/app/libs/
+
+      - name: Sanity check — AWG is compiled in
+        run: |
+          set -e
+          cd amnezia-box
+          tmp=$(mktemp -d)
+          unzip -q -o libbox.aar -d "$tmp"
+          so=$(find "$tmp" -name 'libbox.so' | head -1)
+          if strings -n 8 "$so" | grep -q "Awg is not included in this build"; then
+            echo "::error::AWG stub present — with_awg tag missing from build"; exit 1
+          fi
+          n=$(strings -n 6 "$so" | grep -ci 'amneziawg' || true)
+          echo "amneziawg references in libbox.so: $n"
+          [ "$n" -gt 0 ] || { echo "::error::no amneziawg symbols found"; exit 1; }
+
+      - name: Build APK
+        working-directory: sing-box-for-android
+        run: ./gradlew ":app:${GRADLE_TASK}" --no-daemon --stacktrace
+
+      - name: Upload APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: sfa-awg-apk
+          path: sing-box-for-android/app/build/outputs/apk/**/*.apk
+          if-no-files-found: error
