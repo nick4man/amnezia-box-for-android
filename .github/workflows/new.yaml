@@ -1,15 +1,83 @@
+name: build-awg-apk
+on:
+  workflow_dispatch:
+  push: { branches: [ main ] }
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      CORE_REF: v1.13.8-awg2.0
+      SFA_REF: 1.13.8          # тег sing-box-for-android из той же 1.13.x линии
+      NDK_VER: 27.2.12479018
     steps:
       - uses: actions/checkout@v4
         with: { repository: hoaxisr/amnezia-box, ref: v1.13.8-awg2.0, path: core }
+
       - uses: actions/setup-go@v5
         with: { go-version: '1.24' }
+
       - uses: actions/setup-java@v4
         with: { distribution: temurin, java-version: '21' }
+
       - uses: android-actions/setup-android@v3
-      # gomobile bind -> libbox.aar (этап 1)
-      # checkout SFA, подложить aar, ./gradlew assembleOtherRelease
+
+      - name: Install NDK + SDK packages
+        run: |
+          sdkmanager --install "ndk;${NDK_VER}" "platforms;android-35" \
+                     "build-tools;35.0.0" "platform-tools"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${NDK_VER}" >> $GITHUB_ENV
+          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/${NDK_VER}" >> $GITHUB_ENV
+
+      # ---------- Этап 1: ядро -> libbox.aar (с AWG) ----------
+      - name: Build libbox.aar
+        working-directory: core
+        run: |
+          # gomobile/gobind берём версией, которую тянет сам форк
+          make lib_install || {
+            go install github.com/sagernet/gomobile/cmd/gomobile@v0.1.4
+            go install github.com/sagernet/gomobile/cmd/gobind@v0.1.4
+          }
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          gomobile bind -v -target android -androidapi 21 \
+            -javapkg io.nekohasekai \
+            -o "$GITHUB_WORKSPACE/libbox.aar" \
+            -trimpath \
+            -ldflags "-s -w -X github.com/sagernet/sing-box/constant.Version=${CORE_REF#v}" \
+            -tags "with_gvisor,with_quic,with_wireguard,with_utls,with_clash_api,with_awg" \
+            ./experimental/libbox
+
+      # ---------- Этап 2: SFA -> APK ----------
+      - name: Checkout SFA
+        uses: actions/checkout@v4
+        with: { repository: SagerNet/sing-box-for-android, ref: '1.13.8', path: sfa, submodules: false }
+
+      - name: Inject libbox.aar
+        run: |
+          mkdir -p sfa/app/libs
+          cp libbox.aar sfa/app/libs/libbox.aar
+          # ПРОВЕРЬ зависимость в sfa/app/build.gradle.kts:
+          #   implementation(files("libs/libbox.aar"))  ИЛИ  implementation(fileTree("libs"))
+          # если там implementation(project(":libbox")) — клади aar туда, куда смотрит этот модуль
+
+      - name: Build APK
+        working-directory: sfa
+        run: |
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+          ./gradlew :app:assembleOtherRelease --no-daemon --stacktrace
+
+      # ---------- Подпись ----------
+      - name: Sign APK
+        run: |
+          echo "${{ secrets.KEYSTORE_B64 }}" | base64 -d > ks.jks
+          BT="$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -1)"
+          UNSIGNED="$(find sfa -name '*-other-release*.apk' | head -1)"
+          "$BT/zipalign" -v -p 4 "$UNSIGNED" aligned.apk
+          "$BT/apksigner" sign --ks ks.jks \
+            --ks-pass pass:${{ secrets.KS_PASS }} \
+            --key-pass pass:${{ secrets.KEY_PASS }} \
+            --ks-key-alias ${{ secrets.KEY_ALIAS }} \
+            --out sfa-awg.apk aligned.apk
+
       - uses: actions/upload-artifact@v4
-        with: { name: sfa-awg, path: '**/*.apk' }
+        with: { name: sfa-awg, path: sfa-awg.apk }
