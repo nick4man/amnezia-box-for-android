@@ -1,68 +1,78 @@
-name: Build SFA (AmneziaWG)
+name: Build amnezia-box-for-android (AmneziaWG)
 
-# Builds the sing-box-for-android (SFA) APK using libbox built from THIS fork,
-# with AmneziaWG compiled in. The with_awg build tag is enabled at CI time,
-# so this workflow does not require any source change to be committed.
+# This workflow lives in the APP repo (a fork of sing-box-for-android) and builds
+# an APK whose libbox core comes from the amnezia-box Go fork, with AmneziaWG
+# compiled in (the with_awg build tag is enabled at CI time — no source commit needed).
 #
-# Pipeline:
-#   1. build libbox.aar / libbox-legacy.aar from this repo via gomobile + NDK
-#   2. drop the AARs into sing-box-for-android/app/libs
-#   3. assemble the APK with Gradle
+# Topology (this was the bug in the earlier version — the app repo is NOT the Go core):
+#   - APP  = THIS repo (sing-box-for-android fork)         -> checked out to ./app
+#   - CORE = amnezia-box Go fork (provides libbox + AWG)   -> checked out to ./core
 #
-# SFA is pinned by commit to the release that matches this fork's sing-box version.
-# Default = ab09918615e3fbfb6f2f17a06f1b49448dcccbb1 ("Bump version 1.13.8").
-# Bump `sfa_ref` whenever you rebase the fork onto a newer sing-box.
+# IMPORTANT — version compatibility:
+#   The APP's Kotlin uses libbox APIs that must match the CORE's sing-box version.
+#   App 1.14.0-alpha does NOT compile against a 1.13.8 core (CommandOutbounds /
+#   Tailscale peer fields differ). Defaults below pin BOTH sides to 1.13.8, which
+#   is a known-good combination. To move up, bump app_ref AND use a core of the
+#   same sing-box version.
 
 on:
   workflow_dispatch:
     inputs:
-      sfa_ref:
-        description: 'sing-box-for-android git ref (full 40-char commit SHA recommended)'
+      app_ref:
+        description: 'App (this repo) git ref — must match the core sing-box version. Default = 1.13.8.'
         default: 'ab09918615e3fbfb6f2f17a06f1b49448dcccbb1'
         required: true
+      core_repo:
+        description: 'amnezia-box core repo (must contain include/awg.go)'
+        default: 'hoaxisr/amnezia-box'
+        required: true
+      core_ref:
+        description: 'amnezia-box core git ref (branch/tag/full-SHA). Default = v1.13.8-awg2.0 line.'
+        default: 'main'
+        required: true
       gradle_task:
-        description: 'Gradle assemble task (e.g. assembleOtherDebug, assembleOtherRelease, assemblePlayRelease)'
+        description: 'Gradle assemble task (assembleOtherDebug / assembleOtherRelease / assemblePlayRelease)'
         default: 'assembleOtherDebug'
         required: true
-  push:
-    tags:
-      - 'v*'
 
 jobs:
   build:
     runs-on: ubuntu-latest
     env:
       NDK_VERSION: '28.0.13004108'
-      SFA_REF: ${{ github.event.inputs.sfa_ref || 'ab09918615e3fbfb6f2f17a06f1b49448dcccbb1' }}
+      APP_REF: ${{ github.event.inputs.app_ref || 'ab09918615e3fbfb6f2f17a06f1b49448dcccbb1' }}
+      CORE_REPO: ${{ github.event.inputs.core_repo || 'hoaxisr/amnezia-box' }}
+      CORE_REF: ${{ github.event.inputs.core_ref || 'main' }}
       GRADLE_TASK: ${{ github.event.inputs.gradle_task || 'assembleOtherDebug' }}
     steps:
-      - name: Checkout amnezia-box (this fork)
+      - name: Checkout app (this sing-box-for-android fork)
         uses: actions/checkout@v4
         with:
-          path: amnezia-box
-          fetch-depth: 0          # full history + tags: build_libbox uses `git describe --tags`
+          ref: ${{ env.APP_REF }}    # full 40-char SHA; must be reachable in this repo's history
+          path: app
+          fetch-depth: 0
           submodules: recursive
 
-      - name: Checkout sing-box-for-android
+      - name: Checkout amnezia-box core
         uses: actions/checkout@v4
         with:
-          repository: SagerNet/sing-box-for-android
-          ref: ${{ env.SFA_REF }}   # full 40-char commit SHA (short SHA is treated as a ref name and fails)
-          fetch-depth: 0            # full history so the pinned commit is always present
-          path: sing-box-for-android
+          repository: ${{ env.CORE_REPO }}
+          ref: ${{ env.CORE_REF }}
+          path: core
+          fetch-depth: 0            # build_libbox uses `git describe --tags` for the version
           submodules: recursive
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
-          distribution: temurin   # `java --version` prints "openjdk 17..." -> passes checkJavaVersion()
+          distribution: temurin     # `java --version` prints "openjdk 17..." -> passes checkJavaVersion()
           java-version: '17'
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.25.x'    # >= 1.25 required by the badlinkname / -checklinkname=0 tags
-          cache-dependency-path: amnezia-box/go.sum
+          go-version: '1.25.x'      # >= 1.25 required by the badlinkname / -checklinkname=0 tags
+          cache-dependency-path: core/go.sum
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
@@ -72,23 +82,21 @@ jobs:
         # build_shared.FindSDK() auto-detects $ANDROID_HOME/ndk/${NDK_VERSION}
 
       - name: Install gomobile / gobind (SagerNet fork)
-        working-directory: amnezia-box
+        working-directory: core
         run: |
-          # installed directly (not via `make lib_install`) so this works
-          # regardless of the Makefile state on the checked-out ref
           go install -v github.com/sagernet/gomobile/cmd/gomobile@v0.1.12
           go install -v github.com/sagernet/gomobile/cmd/gobind@v0.1.12
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
-      - name: Ensure AmneziaWG build tag is enabled
-        working-directory: amnezia-box
+      - name: Ensure AmneziaWG build tag is enabled (in core)
+        working-directory: core
         run: |
           set -e
           f=cmd/internal/build_libbox/main.go
+          [ -f "$f" ] || { echo "::error::$f not found in core repo '${CORE_REPO}' — wrong core?"; exit 1; }
           if grep -q '"with_awg"' "$f"; then
-            echo "with_awg already present in build_libbox"
+            echo "with_awg already present"
           else
-            # inject into the shared gomobile build tags
             sed -i 's/"with_clash_api"/"with_clash_api", "with_awg"/' "$f"
             grep -q '"with_awg"' "$f" || { echo "::error::failed to inject with_awg"; exit 1; }
             echo "injected with_awg into $f"
@@ -96,24 +104,24 @@ jobs:
           grep -n 'with_awg' "$f"
 
       - name: Build libbox.aar (with AmneziaWG)
-        working-directory: amnezia-box
+        working-directory: core
         run: go run ./cmd/internal/build_libbox -target android
         # produces libbox.aar (API 23) and libbox-legacy.aar (API 21), all ABIs
 
-      - name: Stage AARs into SFA
+      - name: Stage AARs into the app
         run: |
-          mkdir -p sing-box-for-android/app/libs
-          cp amnezia-box/libbox.aar        sing-box-for-android/app/libs/
-          cp amnezia-box/libbox-legacy.aar sing-box-for-android/app/libs/
-          ls -lh sing-box-for-android/app/libs/
+          mkdir -p app/app/libs
+          cp core/libbox.aar        app/app/libs/
+          cp core/libbox-legacy.aar app/app/libs/
+          ls -lh app/app/libs/
 
       - name: Sanity check — AWG is compiled in
+        working-directory: core
         run: |
           set -e
-          cd amnezia-box
           tmp=$(mktemp -d)
           unzip -q -o libbox.aar -d "$tmp"
-          so=$(find "$tmp" -name 'libbox.so' | head -1)
+          so=$(find "$tmp" -path '*arm64-v8a*' -name 'libbox.so' | head -1)
           if strings -n 8 "$so" | grep -q "Awg is not included in this build"; then
             echo "::error::AWG stub present — with_awg tag missing from build"; exit 1
           fi
@@ -122,12 +130,14 @@ jobs:
           [ "$n" -gt 0 ] || { echo "::error::no amneziawg symbols found"; exit 1; }
 
       - name: Build APK
-        working-directory: sing-box-for-android
-        run: ./gradlew ":app:${GRADLE_TASK}" --no-daemon --stacktrace
+        working-directory: app
+        run: |
+          echo "sdk.dir=${ANDROID_HOME}" > local.properties
+          ./gradlew ":app:${GRADLE_TASK}" --no-daemon --stacktrace
 
       - name: Upload APKs
         uses: actions/upload-artifact@v4
         with:
-          name: sfa-awg-apk
-          path: sing-box-for-android/app/build/outputs/apk/**/*.apk
+          name: amnezia-box-android-apk
+          path: app/app/build/outputs/apk/**/*.apk
           if-no-files-found: error
