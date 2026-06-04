@@ -1,22 +1,23 @@
 name: Build SFA (AmneziaWG)
 
 # Builds the sing-box-for-android (SFA) APK using libbox built from THIS fork,
-# with AmneziaWG compiled in (-tags with_awg, already wired into cmd/internal/build_libbox).
+# with AmneziaWG compiled in. The with_awg build tag is enabled at CI time,
+# so this workflow does not require any source change to be committed.
 #
-# Pipeline (mirrors the local Makefile flow):
+# Pipeline:
 #   1. build libbox.aar / libbox-legacy.aar from this repo via gomobile + NDK
 #   2. drop the AARs into sing-box-for-android/app/libs
 #   3. assemble the APK with Gradle
 #
 # SFA is pinned by commit to the release that matches this fork's sing-box version.
-# Default = ab09918615e3fbfb6f2f17a06f1b49448dcccbb1 ("Bump version 1.13.8"), matching v1.13.8-awg2.0.
+# Default = ab09918615e3fbfb6f2f17a06f1b49448dcccbb1 ("Bump version 1.13.8").
 # Bump `sfa_ref` whenever you rebase the fork onto a newer sing-box.
 
 on:
   workflow_dispatch:
     inputs:
       sfa_ref:
-        description: 'sing-box-for-android git ref (tag/branch/commit) matching this fork'
+        description: 'sing-box-for-android git ref (full 40-char commit SHA recommended)'
         default: 'ab09918615e3fbfb6f2f17a06f1b49448dcccbb1'
         required: true
       gradle_task:
@@ -73,12 +74,30 @@ jobs:
       - name: Install gomobile / gobind (SagerNet fork)
         working-directory: amnezia-box
         run: |
-          make lib_install
+          # installed directly (not via `make lib_install`) so this works
+          # regardless of the Makefile state on the checked-out ref
+          go install -v github.com/sagernet/gomobile/cmd/gomobile@v0.1.12
+          go install -v github.com/sagernet/gomobile/cmd/gobind@v0.1.12
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Ensure AmneziaWG build tag is enabled
+        working-directory: amnezia-box
+        run: |
+          set -e
+          f=cmd/internal/build_libbox/main.go
+          if grep -q '"with_awg"' "$f"; then
+            echo "with_awg already present in build_libbox"
+          else
+            # inject into the shared gomobile build tags
+            sed -i 's/"with_clash_api"/"with_clash_api", "with_awg"/' "$f"
+            grep -q '"with_awg"' "$f" || { echo "::error::failed to inject with_awg"; exit 1; }
+            echo "injected with_awg into $f"
+          fi
+          grep -n 'with_awg' "$f"
 
       - name: Build libbox.aar (with AmneziaWG)
         working-directory: amnezia-box
-        run: make lib_android
+        run: go run ./cmd/internal/build_libbox -target android
         # produces libbox.aar (API 23) and libbox-legacy.aar (API 21), all ABIs
 
       - name: Stage AARs into SFA
