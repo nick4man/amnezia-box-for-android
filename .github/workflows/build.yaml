@@ -9,7 +9,7 @@ name: Build SFA (AmneziaWG)
 #   3. assemble the APK with Gradle
 #
 # SFA is pinned by commit to the release that matches this fork's sing-box version.
-# Default = ab09918615e3 ("Bump version 1.13.8"), matching v1.13.8-awg2.0.
+# Default = ab09918615e3fbfb6f2f17a06f1b49448dcccbb1 ("Bump version 1.13.8"), matching v1.13.8-awg2.0.
 # Bump `sfa_ref` whenever you rebase the fork onto a newer sing-box.
 
 on:
@@ -17,7 +17,7 @@ on:
     inputs:
       sfa_ref:
         description: 'sing-box-for-android git ref (tag/branch/commit) matching this fork'
-        default: 'ab09918615e3'
+        default: 'ab09918615e3fbfb6f2f17a06f1b49448dcccbb1'
         required: true
       gradle_task:
         description: 'Gradle assemble task (e.g. assembleOtherDebug, assembleOtherRelease, assemblePlayRelease)'
@@ -32,7 +32,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       NDK_VERSION: '28.0.13004108'
-      SFA_REF: ${{ github.event.inputs.sfa_ref || 'ab09918615e3' }}
+      SFA_REF: ${{ github.event.inputs.sfa_ref || 'ab09918615e3fbfb6f2f17a06f1b49448dcccbb1' }}
       GRADLE_TASK: ${{ github.event.inputs.gradle_task || 'assembleOtherDebug' }}
     steps:
       - name: Checkout amnezia-box (this fork)
@@ -46,7 +46,8 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: SagerNet/sing-box-for-android
-          ref: ${{ env.SFA_REF }}
+          ref: ${{ env.SFA_REF }}   # full 40-char commit SHA (short SHA is treated as a ref name and fails)
+          fetch-depth: 0            # full history so the pinned commit is always present
           path: sing-box-for-android
           submodules: recursive
 
