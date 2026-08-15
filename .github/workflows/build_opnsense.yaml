@@ -307,12 +307,37 @@ jobs:
           chmod 0600 stage/usr/local/etc/sing-box/config.json.sample
 
           # ---- plist (paths relative to prefix) -----------------------------
+          # Only builtin keywords here: @sample lives in the ports tree
+          # (/usr/ports/Keywords/sample.ucl), which the packaging VM does not have.
+          # The sample-config dance is done by the scripts below instead.
+          # Owners/modes are taken from the stage tree.
           cat > meta/plist <<'PLIST'
           bin/sing-box
           etc/rc.d/sing_box
-          @sample(root,wheel,0600) etc/sing-box/config.json.sample
-          @dir(root,wheel,0700) /var/db/sing-box
+          etc/sing-box/config.json.sample
+          @dir /var/db/sing-box
           PLIST
+
+          # ---- install scripts (pkg picks these up from the metadata dir) ----
+          cat > meta/+POST_INSTALL <<'POST'
+          #!/bin/sh
+          cfg=/usr/local/etc/sing-box/config.json
+          if [ ! -f "${cfg}" ]; then
+              cp -p "${cfg}.sample" "${cfg}"
+              echo "==> ${cfg} created from the sample. Edit it, then:"
+              echo "    echo 'sing_box_enable=YES' > /etc/rc.conf.d/sing_box"
+              echo "    service sing_box start"
+          fi
+          POST
+
+          cat > meta/+PRE_DEINSTALL <<'PRE'
+          #!/bin/sh
+          cfg=/usr/local/etc/sing-box/config.json
+          # Remove the config only while it is still an untouched copy of the sample.
+          if [ -f "${cfg}" ] && cmp -s "${cfg}" "${cfg}.sample"; then
+              rm -f "${cfg}"
+          fi
+          PRE
 
           # ---- manifest ------------------------------------------------------
           cat > meta/+MANIFEST <<MANIFEST
@@ -359,6 +384,8 @@ jobs:
             # Sanity: the package must be readable, installable and actually run.
             pkg info -F out/sing-box-*.pkg
             pkg add -f out/sing-box-*.pkg
+            # +POST_INSTALL must have seeded the live config from the sample.
+            test -f /usr/local/etc/sing-box/config.json
             /usr/local/bin/sing-box version
             /usr/local/bin/sing-box version | grep -qi 'with_awg' \
               || { echo "::error::with_awg missing from the version banner tags"; exit 1; }
@@ -375,6 +402,9 @@ jobs:
             test -x /usr/local/etc/rc.d/sing_box
             service sing_box status || true          # not enabled -> non-zero exit, that is expected
             pkg delete -y sing-box
+            # +PRE_DEINSTALL drops the untouched config; the sample goes with the package.
+            test ! -e /usr/local/etc/sing-box/config.json
+            echo "install/deinstall scripts behave"
 
       - name: Rename + checksum the package
         run: |
