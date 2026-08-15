@@ -8,8 +8,8 @@ name: Build sing-box (OPNsense / FreeBSD, AmneziaWG)
 #
 # Two jobs:
 #   1) build   — cross-compiles GOOS=freebsd on ubuntu-latest via the core's own
-#                `make build` (tags/version/ldflags come from the Makefile; TAGS
-#                already include with_awg). Pure-Go static build (CGO_ENABLED=0),
+#                `make build` (version/ldflags come from the Makefile; with_awg is
+#                appended to the default tags). Pure-Go static build (CGO_ENABLED=0),
 #                so cross-compiling is byte-for-byte equivalent to a native build.
 #                Artifacts: raw binary + .tar.gz.
 #   2) package — runs a real FreeBSD 15.1 VM and calls pkg(8) to produce a proper
@@ -35,9 +35,9 @@ on:
         default: 'hoaxisr/amnezia-box'
         required: true
       core_ref:
-        description: 'core git ref (branch / tag / full 40-char SHA)'
-        default: 'main'
-        required: true
+        description: 'core git ref (branch / tag / full 40-char SHA). Empty = the core repo default branch.'
+        default: 'awg-1.14'
+        required: false
       goarches:
         description: 'Comma-separated FreeBSD architectures (amd64 for OPNsense CE; arm64 also possible)'
         default: 'amd64'
@@ -75,13 +75,34 @@ jobs:
       matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
     env:
       CORE_REPO: ${{ github.event.inputs.core_repo || 'hoaxisr/amnezia-box' }}
-      CORE_REF: ${{ github.event.inputs.core_ref || 'main' }}
+      CORE_REF: ${{ github.event.inputs.core_ref || 'awg-1.14' }}
     steps:
+      - name: Resolve core ref
+        id: ref
+        run: |
+          set -e
+          # The core repo renames its AWG branch over time (main -> awg-1.14 -> ...),
+          # which used to fail the checkout outright. Fall back to whatever the repo
+          # says is its default branch instead of dying on a stale input.
+          url="https://github.com/${CORE_REPO}.git"
+          want="${CORE_REF}"
+          if printf '%s' "$want" | grep -Eq '^[0-9a-f]{40}$'; then
+            resolved="$want"                       # full SHA — ls-remote cannot list it
+          elif [ -n "$want" ] && git ls-remote --exit-code "$url" "refs/heads/$want" "refs/tags/$want" >/dev/null 2>&1; then
+            resolved="$want"
+          else
+            resolved=$(git ls-remote --symref "$url" HEAD | awk '/^ref:/{sub("refs/heads/","",$2); print $2; exit}')
+            [ -n "$resolved" ] || { echo "::error::cannot resolve any ref in $url"; exit 1; }
+            echo "::warning::core ref '${want}' not found in ${CORE_REPO} — using default branch '${resolved}'"
+          fi
+          echo "ref=$resolved" >> "$GITHUB_OUTPUT"
+          echo "building ${CORE_REPO}@${resolved}"
+
       - name: Checkout amnezia-box core
         uses: actions/checkout@v4
         with:
           repository: ${{ env.CORE_REPO }}
-          ref: ${{ env.CORE_REF }}
+          ref: ${{ steps.ref.outputs.ref }}
           fetch-depth: 0          # Makefile derives VERSION from `git describe --tags`
           submodules: recursive
 
@@ -104,7 +125,17 @@ jobs:
         run: |
           set -e
           [ "$GOARCH" = "arm" ] && export GOARM=7   # 32-bit ARM -> ARMv7
-          make build                                # TAGS already include with_awg
+
+          # release/DEFAULT_BUILD_TAGS_OTHERS does NOT carry with_awg on the awg-1.14
+          # branch (it did on the old main), so append it instead of trusting the file.
+          tags=$(tr -d '\r\n' < release/DEFAULT_BUILD_TAGS_OTHERS)
+          case ",${tags}," in
+            *,with_awg,*) ;;
+            *) tags="${tags},with_awg" ;;
+          esac
+          echo "build tags: $tags"
+
+          make build TAGS="$tags"
           test -f sing-box
           ver=$(git describe --tags --always | sed 's/^v//')
           out="sing-box-${ver}-freebsd-${GOARCH}"
@@ -225,35 +256,52 @@ jobs:
           chmod 0755 stage/usr/local/etc/rc.d/sing_box
 
           # ---- sample config -----------------------------------------------
+          # AWG is an *endpoint* type in the 1.14 core (option.AwgEndpointOptions):
+          # peers[] instead of the flat 1.13 wireguard outbound, and h1..h4 are strings.
           cat > stage/usr/local/etc/sing-box/config.json.sample <<'CFG'
           {
             "log": {
               "level": "info",
               "timestamp": true
             },
-            "outbounds": [
+            "endpoints": [
               {
-                "type": "wireguard",
-                "tag": "awg-out",
-                "server": "1.2.3.4",
-                "server_port": 51820,
-                "local_address": ["10.0.0.2/32"],
+                "type": "awg",
+                "tag": "awg-ep",
+                "address": ["10.0.0.2/32"],
                 "private_key": "PRIVATE_KEY_BASE64",
-                "peer_public_key": "PEER_PUBLIC_KEY_BASE64",
                 "mtu": 1420,
-                "awg": {
-                  "jc": 4,
-                  "jmin": 40,
-                  "jmax": 70,
-                  "s1": 0,
-                  "s2": 0,
-                  "h1": 1,
-                  "h2": 2,
-                  "h3": 3,
-                  "h4": 4
-                }
+                "jc": 4,
+                "jmin": 40,
+                "jmax": 70,
+                "s1": 0,
+                "s2": 0,
+                "h1": "1",
+                "h2": "2",
+                "h3": "3",
+                "h4": "4",
+                "peers": [
+                  {
+                    "address": "1.2.3.4",
+                    "port": 51820,
+                    "public_key": "PEER_PUBLIC_KEY_BASE64",
+                    "allowed_ips": ["0.0.0.0/0"],
+                    "persistent_keepalive_interval": 25
+                  }
+                ]
               }
-            ]
+            ],
+            "inbounds": [
+              {
+                "type": "mixed",
+                "tag": "mixed-in",
+                "listen": "127.0.0.1",
+                "listen_port": 1080
+              }
+            ],
+            "route": {
+              "final": "awg-ep"
+            }
           }
           CFG
           chmod 0600 stage/usr/local/etc/sing-box/config.json.sample
@@ -312,9 +360,18 @@ jobs:
             pkg info -F out/sing-box-*.pkg
             pkg add -f out/sing-box-*.pkg
             /usr/local/bin/sing-box version
-            if ! /usr/local/bin/sing-box version | grep -qi 'with_awg'; then
-              echo "::warning::with_awg missing from the version banner tags — check the core build tags"
-            fi
+            /usr/local/bin/sing-box version | grep -qi 'with_awg' \
+              || { echo "::error::with_awg missing from the version banner tags"; exit 1; }
+
+            # Runtime proof that the awg endpoint is registered (stronger than a strings
+            # grep): fill the shipped sample with real keys and let sing-box parse it.
+            priv=$(/usr/local/bin/sing-box generate wg-keypair | awk '/PrivateKey/{print $2}')
+            pub=$(/usr/local/bin/sing-box generate wg-keypair | awk '/PublicKey/{print $2}')
+            sed -e "s#PRIVATE_KEY_BASE64#${priv}#" -e "s#PEER_PUBLIC_KEY_BASE64#${pub}#" \
+              /usr/local/etc/sing-box/config.json.sample > /tmp/awg-check.json
+            /usr/local/bin/sing-box check -c /tmp/awg-check.json
+            echo "sample config parses and the awg endpoint is live"
+
             test -x /usr/local/etc/rc.d/sing_box
             service sing_box status || true          # not enabled -> non-zero exit, that is expected
             pkg delete -y sing-box
