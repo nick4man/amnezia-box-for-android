@@ -1,0 +1,340 @@
+name: Build sing-box (OPNsense / FreeBSD, AmneziaWG)
+
+# Builds the amnezia-box core (cmd/sing-box) for OPNsense 26.7.x "Xenial Xenops"
+# (base: FreeBSD 15.1-RELEASE, ABI FreeBSD:15:amd64) with AmneziaWG compiled in.
+#
+# Self-contained: the core is checked out EXPLICITLY from core_repo
+# (default hoaxisr/amnezia-box), so it works regardless of which repo hosts this file.
+#
+# Two jobs:
+#   1) build   — cross-compiles GOOS=freebsd on ubuntu-latest via the core's own
+#                `make build` (tags/version/ldflags come from the Makefile; TAGS
+#                already include with_awg). Pure-Go static build (CGO_ENABLED=0),
+#                so cross-compiling is byte-for-byte equivalent to a native build.
+#                Artifacts: raw binary + .tar.gz.
+#   2) package — runs a real FreeBSD 15.1 VM and calls pkg(8) to produce a proper
+#                package (rc.d script + @sample config) installable on OPNsense with
+#                `pkg add ./sing-box-*.pkg`. amd64 only by default.
+#
+# Install on the firewall (as root):
+#   pkg add ./sing-box-<ver>-freebsd-amd64.pkg
+#   cp /usr/local/etc/sing-box/config.json.sample /usr/local/etc/sing-box/config.json  # if not auto-created
+#   echo 'sing_box_enable=YES' > /etc/rc.conf.d/sing_box   # OPNsense regenerates /etc/rc.conf, rc.conf.d persists
+#   service sing_box start
+#
+# Notes:
+#   - naive_outbound/cronet is omitted (needs libcronet via CGO).
+#   - Packages are not part of the OPNsense repo, so a major firmware upgrade may
+#     remove them — re-add the .pkg afterwards.
+
+on:
+  workflow_dispatch:
+    inputs:
+      core_repo:
+        description: 'amnezia-box core repo (must contain the Makefile + cmd/sing-box + include/awg.go)'
+        default: 'hoaxisr/amnezia-box'
+        required: true
+      core_ref:
+        description: 'core git ref (branch / tag / full 40-char SHA)'
+        default: 'main'
+        required: true
+      goarches:
+        description: 'Comma-separated FreeBSD architectures (amd64 for OPNsense CE; arm64 also possible)'
+        default: 'amd64'
+        required: true
+      freebsd_release:
+        description: 'FreeBSD release of the packaging VM — must match the OPNsense base (26.7.x = 15.1)'
+        default: '15.1'
+        required: true
+      make_pkg:
+        description: 'Also build an installable FreeBSD package (.pkg) for amd64'
+        type: boolean
+        default: true
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - id: set
+        run: |
+          arches="${{ github.event.inputs.goarches || 'amd64' }}"
+          json=$(printf '%s' "$arches" | tr ',' '\n' | sed '/^$/d' | jq -R . | jq -cs '{goarch: .}')
+          echo "matrix=$json" >> "$GITHUB_OUTPUT"
+          echo "matrix: $json"
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    env:
+      CORE_REPO: ${{ github.event.inputs.core_repo || 'hoaxisr/amnezia-box' }}
+      CORE_REF: ${{ github.event.inputs.core_ref || 'main' }}
+    steps:
+      - name: Checkout amnezia-box core
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.CORE_REPO }}
+          ref: ${{ env.CORE_REF }}
+          fetch-depth: 0          # Makefile derives VERSION from `git describe --tags`
+          submodules: recursive
+
+      - name: Sanity — this repo is the core
+        run: |
+          test -f Makefile && test -d cmd/sing-box || {
+            echo "::error::core_repo '${CORE_REPO}@${CORE_REF}' has no Makefile/cmd/sing-box — wrong repo?"; exit 1; }
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'    # >= 1.25 required by the badlinkname / -checklinkname=0 tags
+          cache-dependency-path: go.sum
+
+      - name: Build sing-box (with AmneziaWG)
+        env:
+          GOOS: freebsd
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+        run: |
+          set -e
+          [ "$GOARCH" = "arm" ] && export GOARM=7   # 32-bit ARM -> ARMv7
+          make build                                # TAGS already include with_awg
+          test -f sing-box
+          ver=$(git describe --tags --always | sed 's/^v//')
+          out="sing-box-${ver}-freebsd-${GOARCH}"
+          mv sing-box "$out"
+          echo "VERSION=$ver" >> "$GITHUB_ENV"
+          echo "OUT=$out" >> "$GITHUB_ENV"
+          echo "built $out"
+          file "$out" || true
+
+      - name: Verify AWG is compiled in
+        run: |
+          set -e
+          if strings -a -n 8 "$OUT" | grep -q "Awg is not included in this build"; then
+            echo "::error::AWG stub present — with_awg tag missing"; exit 1
+          fi
+          n=$(strings -a -n 6 "$OUT" | grep -ci 'amneziawg' || true)
+          echo "amneziawg references: $n"
+          [ "$n" -gt 0 ] || { echo "::error::no amneziawg symbols found"; exit 1; }
+
+      - name: Verify the ELF really targets FreeBSD
+        run: |
+          set -e
+          # Go stamps ELFOSABI_FREEBSD in the header for GOOS=freebsd — catches a GOOS mix-up.
+          if ! { readelf -h "$OUT" | grep -qi 'freebsd' || file "$OUT" | grep -qi 'freebsd'; }; then
+            echo "::error::$OUT does not look like a FreeBSD ELF"
+            readelf -h "$OUT"; file "$OUT"; exit 1
+          fi
+
+      - name: Package tarball + checksum
+        run: |
+          set -e
+          tar czf "${OUT}.tar.gz" "$OUT"
+          sha256sum "$OUT" "${OUT}.tar.gz" > "${OUT}.sha256"
+          cat "${OUT}.sha256"
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: sing-box-freebsd-${{ matrix.goarch }}
+          path: |
+            ${{ env.OUT }}
+            ${{ env.OUT }}.tar.gz
+            ${{ env.OUT }}.sha256
+          if-no-files-found: error
+
+  package:
+    # OPNsense CE ships amd64 only; the .pkg job therefore targets amd64.
+    needs: build
+    if: ${{ github.event.inputs.make_pkg != 'false' && contains(github.event.inputs.goarches || 'amd64', 'amd64') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch the freebsd/amd64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: sing-box-freebsd-amd64
+          path: dist
+
+      - name: Stage the package tree
+        run: |
+          set -e
+          bin=$(ls dist/sing-box-*-freebsd-amd64 | grep -v -e '\.tar\.gz$' -e '\.sha256$' | head -n1)
+          test -n "$bin" || { echo "::error::binary not found in artifact"; exit 1; }
+          ver=$(basename "$bin" | sed -e 's/^sing-box-//' -e 's/-freebsd-amd64$//')
+          # pkg versions must not contain '-' (it separates name from version) — normalise.
+          pkgver=$(printf '%s' "$ver" | tr '-' '.')
+          echo "PKGVERSION=$pkgver" >> "$GITHUB_ENV"
+          echo "RAWVERSION=$ver"    >> "$GITHUB_ENV"
+
+          mkdir -p stage/usr/local/bin stage/usr/local/etc/rc.d stage/usr/local/etc/sing-box meta out
+          mkdir -p stage/var/db/sing-box && chmod 0700 stage/var/db/sing-box
+          install -m 0755 "$bin" stage/usr/local/bin/sing-box
+
+          # ---- rc.d service ------------------------------------------------
+          cat > stage/usr/local/etc/rc.d/sing_box <<'RC'
+          #!/bin/sh
+          #
+          # PROVIDE: sing_box
+          # REQUIRE: LOGIN FILESYSTEMS defaultroute
+          # KEYWORD: shutdown
+          #
+          # sing_box_enable (bool):   Set to NO by default. YES to enable sing-box.
+          # sing_box_config (path):   Config file. Default /usr/local/etc/sing-box/config.json
+          # sing_box_workdir (path):  Working directory. Default /var/db/sing-box
+          # sing_box_flags (str):     Extra flags passed to `sing-box run`.
+
+          . /etc/rc.subr
+
+          name="sing_box"
+          rcvar="sing_box_enable"
+          desc="sing-box universal proxy platform (AmneziaWG)"
+
+          load_rc_config $name
+
+          : ${sing_box_enable:="NO"}
+          : ${sing_box_config:="/usr/local/etc/sing-box/config.json"}
+          : ${sing_box_workdir:="/var/db/sing-box"}
+          : ${sing_box_flags:=""}
+
+          pidfile="/var/run/${name}.pid"
+          procname="/usr/local/bin/sing-box"
+          command="/usr/sbin/daemon"
+          # -p (child pidfile) rather than -P: rc.subr matches the pid against
+          # ${procname}, so start/stop/status control sing-box itself, not daemon(8).
+          command_args="-f -p ${pidfile} -t ${name} ${procname} -D ${sing_box_workdir} -c ${sing_box_config} ${sing_box_flags} run"
+
+          start_precmd="sing_box_prestart"
+          sing_box_prestart()
+          {
+              if [ ! -f "${sing_box_config}" ]; then
+                  err 1 "${sing_box_config} does not exist - copy config.json.sample and edit it"
+              fi
+              /bin/mkdir -p "${sing_box_workdir}"
+              ${procname} check -c "${sing_box_config}" || err 1 "invalid config: ${sing_box_config}"
+          }
+
+          run_rc_command "$1"
+          RC
+          chmod 0755 stage/usr/local/etc/rc.d/sing_box
+
+          # ---- sample config -----------------------------------------------
+          cat > stage/usr/local/etc/sing-box/config.json.sample <<'CFG'
+          {
+            "log": {
+              "level": "info",
+              "timestamp": true
+            },
+            "outbounds": [
+              {
+                "type": "wireguard",
+                "tag": "awg-out",
+                "server": "1.2.3.4",
+                "server_port": 51820,
+                "local_address": ["10.0.0.2/32"],
+                "private_key": "PRIVATE_KEY_BASE64",
+                "peer_public_key": "PEER_PUBLIC_KEY_BASE64",
+                "mtu": 1420,
+                "awg": {
+                  "jc": 4,
+                  "jmin": 40,
+                  "jmax": 70,
+                  "s1": 0,
+                  "s2": 0,
+                  "h1": 1,
+                  "h2": 2,
+                  "h3": 3,
+                  "h4": 4
+                }
+              }
+            ]
+          }
+          CFG
+          chmod 0600 stage/usr/local/etc/sing-box/config.json.sample
+
+          # ---- plist (paths relative to prefix) -----------------------------
+          cat > meta/plist <<'PLIST'
+          bin/sing-box
+          etc/rc.d/sing_box
+          @sample(root,wheel,0600) etc/sing-box/config.json.sample
+          @dir(root,wheel,0700) /var/db/sing-box
+          PLIST
+
+          # ---- manifest ------------------------------------------------------
+          cat > meta/+MANIFEST <<MANIFEST
+          name: sing-box
+          version: "${pkgver}"
+          origin: net/sing-box
+          comment: "The universal proxy platform, AmneziaWG-enabled build"
+          maintainer: "noreply@github.com"
+          www: "https://sing-box.sagernet.org"
+          prefix: "/usr/local"
+          abi: "FreeBSD:15:amd64"
+          arch: "freebsd:15:x86:64"
+          categories: [net, security]
+          licenselogic: single
+          licenses: [GPLv3]
+          desc: <<EOD
+          sing-box built from the amnezia-box fork with the with_awg build tag, so the
+          AmneziaWG (obfuscated WireGuard) endpoint and outbound types are available.
+
+          Static pure-Go binary (CGO disabled), built for FreeBSD 15.x / OPNsense 26.7.
+          Enable with:  echo 'sing_box_enable=YES' > /etc/rc.conf.d/sing_box
+          EOD
+          MANIFEST
+
+          echo "--- plist ---";    cat meta/plist
+          echo "--- manifest ---"; cat meta/+MANIFEST
+
+      - name: Build .pkg in a FreeBSD ${{ github.event.inputs.freebsd_release || '15.1' }} VM
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: ${{ github.event.inputs.freebsd_release || '15.1' }}
+          arch: x86_64
+          usesh: true
+          copyback: true
+          envs: 'PKGVERSION RAWVERSION'
+          prepare: |
+            pkg --version >/dev/null 2>&1 || ASSUME_ALWAYS_YES=yes pkg bootstrap -f
+          run: |
+            set -e
+            pkg --version
+            pkg -vv | grep -i 'ABI' || true
+            pkg create -v -f tzst -m meta -p meta/plist -r stage -o out
+            ls -l out
+            # Sanity: the package must be readable, installable and actually run.
+            pkg info -F out/sing-box-*.pkg
+            pkg add -f out/sing-box-*.pkg
+            /usr/local/bin/sing-box version
+            if ! /usr/local/bin/sing-box version | grep -qi 'with_awg'; then
+              echo "::warning::with_awg missing from the version banner tags — check the core build tags"
+            fi
+            test -x /usr/local/etc/rc.d/sing_box
+            service sing_box status || true          # not enabled -> non-zero exit, that is expected
+            pkg delete -y sing-box
+
+      - name: Rename + checksum the package
+        run: |
+          set -e
+          cd out
+          pkgfile=$(ls sing-box-*.pkg 2>/dev/null || ls sing-box-*.txz)
+          final="sing-box-${RAWVERSION}-freebsd-amd64.pkg"
+          [ "$pkgfile" = "$final" ] || mv "$pkgfile" "$final"
+          sha256sum "$final" > "${final}.sha256"
+          cat "${final}.sha256"
+          echo "PKGFILE=out/$final" >> "$GITHUB_ENV"
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: sing-box-opnsense-amd64-pkg
+          path: |
+            out/*.pkg
+            out/*.sha256
+          if-no-files-found: error
