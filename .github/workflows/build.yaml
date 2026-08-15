@@ -10,26 +10,29 @@ name: Build amnezia-box-for-android (AmneziaWG)
 #
 # IMPORTANT — version compatibility:
 #   The APP's Kotlin uses libbox APIs that must match the CORE's sing-box version.
-#   App 1.14.0-alpha does NOT compile against a 1.13.8 core (CommandOutbounds /
-#   Tailscale peer fields differ). Defaults below pin BOTH sides to 1.13.8, which
-#   is a known-good combination. To move up, bump app_ref AND use a core of the
-#   same sing-box version.
+#   A 1.14 app does NOT compile against a 1.13.x core (CommandOutbounds / Tailscale
+#   peer fields differ), so app_ref and core_ref must stay on the same sing-box line.
+#   Defaults pin BOTH sides to 1.14.0-beta.14:
+#     app  = 0ca390d "Bump version 1.14.0-beta.14"
+#     core = awg-1.14 (tagged 1.14.0-beta.14-awgm.10)
+#   The "Check app/core version match" step below fails fast on a mismatched pair
+#   instead of letting it turn into a confusing Kotlin compile error 10 minutes in.
 
 on:
   workflow_dispatch:
     inputs:
       app_ref:
-        description: 'App (this repo) git ref — must match the core sing-box version. Default = 1.13.8.'
-        default: 'ab09918615e3fbfb6f2f17a06f1b49448dcccbb1'
+        description: 'App (this repo) git ref — must match the core sing-box version. Default = 1.14.0-beta.14.'
+        default: '0ca390dca290bf40647975d82b5d2abe9c4f8056'
         required: true
       core_repo:
         description: 'amnezia-box core repo (must contain include/awg.go)'
         default: 'hoaxisr/amnezia-box'
         required: true
       core_ref:
-        description: 'amnezia-box core git ref (branch/tag/full-SHA). Default = v1.13.8-awg2.0 line.'
-        default: 'main'
-        required: true
+        description: 'amnezia-box core git ref (branch/tag/full-SHA). Default = awg-1.14 (1.14.0-beta.14 line).'
+        default: 'awg-1.14'
+        required: false
       gradle_task:
         description: 'Gradle assemble task (assembleOtherDebug / assembleOtherRelease / assemblePlayRelease)'
         default: 'assembleOtherDebug'
@@ -40,15 +43,36 @@ jobs:
     runs-on: ubuntu-latest
     env:
       NDK_VERSION: '28.0.13004108'
-      APP_REF: ${{ github.event.inputs.app_ref || 'ab09918615e3fbfb6f2f17a06f1b49448dcccbb1' }}
+      APP_REF: ${{ github.event.inputs.app_ref || '0ca390dca290bf40647975d82b5d2abe9c4f8056' }}
       CORE_REPO: ${{ github.event.inputs.core_repo || 'hoaxisr/amnezia-box' }}
-      CORE_REF: ${{ github.event.inputs.core_ref || 'main' }}
+      CORE_REF: ${{ github.event.inputs.core_ref || 'awg-1.14' }}
       GRADLE_TASK: ${{ github.event.inputs.gradle_task || 'assembleOtherDebug' }}
     steps:
+      - name: Resolve core ref
+        id: ref
+        run: |
+          set -e
+          # The core repo renames its AWG branch over time (main -> awg-1.14 -> ...),
+          # which fails the checkout outright. Fall back to the repo's own default
+          # branch instead of dying on a stale input.
+          url="https://github.com/${CORE_REPO}.git"
+          want="${CORE_REF}"
+          if printf '%s' "$want" | grep -Eq '^[0-9a-f]{40}$'; then
+            resolved="$want"                       # full SHA — ls-remote cannot list it
+          elif [ -n "$want" ] && git ls-remote --exit-code "$url" "refs/heads/$want" "refs/tags/$want" >/dev/null 2>&1; then
+            resolved="$want"
+          else
+            resolved=$(git ls-remote --symref "$url" HEAD | awk '/^ref:/{sub("refs/heads/","",$2); print $2; exit}')
+            [ -n "$resolved" ] || { echo "::error::cannot resolve any ref in $url"; exit 1; }
+            echo "::warning::core ref '${want}' not found in ${CORE_REPO} — using default branch '${resolved}'"
+          fi
+          echo "ref=$resolved" >> "$GITHUB_OUTPUT"
+          echo "core ${CORE_REPO}@${resolved}"
+
       - name: Checkout app (this sing-box-for-android fork)
         uses: actions/checkout@v4
         with:
-          ref: ${{ env.APP_REF }}    # full 40-char SHA; must be reachable in this repo's history
+          ref: ${{ env.APP_REF }}    # full 40-char SHA; must be reachable in this repo's fork network
           path: app
           fetch-depth: 0
           submodules: recursive
@@ -57,10 +81,28 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ${{ env.CORE_REPO }}
-          ref: ${{ env.CORE_REF }}
+          ref: ${{ steps.ref.outputs.ref }}
           path: core
           fetch-depth: 0            # build_libbox uses `git describe --tags` for the version
           submodules: recursive
+
+      - name: Check app/core version match
+        run: |
+          set -e
+          app_ver=$(sed -n 's/^VERSION_NAME=//p' app/version.properties | tr -d '\r')
+          core_ver=$(cd core && git describe --tags --always | sed -e 's/^v//' -e 's/-awgm[.-][0-9.]*$//')
+          echo "app  : ${app_ver}"
+          echo "core : ${core_ver}"
+          # A 1.13 app against a 1.14 core (or vice versa) cannot compile — stop now.
+          app_line=$(printf '%s' "$app_ver"  | cut -d. -f1,2)
+          core_line=$(printf '%s' "$core_ver" | cut -d. -f1,2)
+          if [ "$app_line" != "$core_line" ]; then
+            echo "::error::sing-box line mismatch: app ${app_ver} vs core ${core_ver} — pick an app_ref/core_ref on the same line"
+            exit 1
+          fi
+          if [ "$app_ver" != "$core_ver" ]; then
+            echo "::warning::app ${app_ver} and core ${core_ver} are on the same line but not identical — libbox API drift is possible"
+          fi
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
