@@ -1,0 +1,230 @@
+{
+  "log": {
+    "level": "info",
+    "timestamp": true,
+    "output": "/var/log/sing-box/sing-box.log"
+  },
+
+  "dns": {
+    "servers": [
+      {
+        "type": "udp",
+        "tag": "local-dns",
+        "server": "127.0.0.1",
+        "server_port": 53
+      },
+      {
+        "type": "tcp",
+        "tag": "proxy-dns",
+        "server": "1.1.1.1",
+        "detour": "proxy",
+        "domain_resolver": "local-dns"
+      }
+    ],
+    "rules": [
+      {
+        "rule_set": "geosite-category-ads-all",
+        "action": "reject"
+      },
+      {
+        "rule_set": "geosite-ru",
+        "server": "local-dns"
+      }
+    ],
+    "final": "proxy-dns",
+    "strategy": "ipv4_only",
+    "reverse_mapping": true
+  },
+
+  "endpoints": [
+    {
+      "type": "awg",
+      "tag": "wg-ep",
+      "useIntegratedTun": false,
+      "private_key": "sO5JTZOln6igXTqwq01GNEI7Npvm32Unyd2E3+G2zFk=",
+      "address": "10.10.0.150/32",
+      "mtu": 1420,
+      "jc": 5,
+      "jmin": 50,
+      "jmax": 1000,
+      "s1": 28,
+      "s2": 137,
+      "h1": "1631980850",
+      "h2": "1967581631",
+      "h3": "1485046168",
+      "h4": "1803539852",
+      "peers": [
+        {
+          "address": "203.0.113.10",
+          "port": 55566,
+          "public_key": "PGknrJdwTJKW61BglVYC9aRs0SeT9PZE6OO3mGAlYgY=",
+          "preshared_key": "ZyICkruRFTzPsCw9ERaRiBL4Jw3OaBbvUs/uaJ7fLRo=",
+          "allowed_ips": "10.10.0.0/24",
+          "persistent_keepalive_interval": 25
+        }
+      ]
+    }
+  ],
+
+  "inbounds": [
+    {
+      "type": "socks",
+      "tag": "socks-lo",
+      "listen": "127.0.0.1",
+      "listen_port": 1080
+    },
+    {
+      "type": "socks",
+      "tag": "socks-lan",
+      "listen": "192.168.1.1",
+      "listen_port": 1080
+    },
+    {
+      "type": "http",
+      "tag": "http-lo",
+      "listen": "127.0.0.1",
+      "listen_port": 8080
+    },
+    {
+      "type": "http",
+      "tag": "http-lan",
+      "listen": "192.168.1.1",
+      "listen_port": 8080
+    }
+  ],
+
+  "outbounds": [
+    {
+      "type": "selector",
+      "tag": "proxy",
+      "outbounds": ["auto", "vless-1", "vless-2", "wg-ep"],
+      "default": "auto"
+    },
+    {
+      "type": "urltest",
+      "tag": "auto",
+      "outbounds": ["vless-1", "vless-2"],
+      "url": "https://www.gstatic.com/generate_204",
+      "interval": "3m0s",
+      "tolerance": 80
+    },
+    {
+      "type": "vless",
+      "tag": "vless-1",
+      "server": "203.0.113.20",
+      "server_port": 443,
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+      "tls": {
+        "enabled": true,
+        "server_name": "example.org",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      },
+      "transport": {
+        "type": "grpc",
+        "service_name": "grpc"
+      }
+    },
+    {
+      "type": "vless",
+      "tag": "vless-2",
+      "server": "203.0.113.21",
+      "server_port": 443,
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+      "tls": {
+        "enabled": true,
+        "server_name": "example.org",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      },
+      "transport": {
+        "type": "ws",
+        "path": "/ws",
+        "headers": {
+          "Host": "example.org"
+        }
+      }
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+
+  "route": {
+    "rules": [
+      {
+        "action": "sniff"
+      },
+      {
+        "protocol": "dns",
+        "action": "hijack-dns"
+      },
+      {
+        "ip_cidr": "10.10.0.0/24",
+        "outbound": "wg-ep"
+      },
+      {
+        "ip_is_private": true,
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [".internal", ".lan"],
+        "outbound": "direct"
+      },
+      {
+        "rule_set": "geosite-category-ads-all",
+        "action": "reject"
+      },
+      {
+        "rule_set": ["geosite-ru", "geoip-ru"],
+        "outbound": "direct"
+      }
+    ],
+
+    "rule_set": [
+      {
+        "type": "remote",
+        "tag": "geosite-ru",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ru.srs",
+        "download_detour": "proxy",
+        "update_interval": "72h"
+      },
+      {
+        "type": "remote",
+        "tag": "geoip-ru",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-ru.srs",
+        "download_detour": "proxy",
+        "update_interval": "72h"
+      },
+      {
+        "type": "remote",
+        "tag": "geosite-category-ads-all",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ads-all.srs",
+        "download_detour": "proxy",
+        "update_interval": "72h"
+      }
+    ],
+
+    "final": "proxy",
+    "default_domain_resolver": "local-dns"
+  },
+
+  "experimental": {
+    "cache_file": {
+      "enabled": true,
+      "path": "/var/db/sing-box/cache.db"
+    },
+    "clash_api": {
+      "external_controller": "127.0.0.1:9090",
+      "default_mode": "rule"
+    }
+  }
+}
