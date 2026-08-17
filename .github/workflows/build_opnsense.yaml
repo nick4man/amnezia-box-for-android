@@ -430,12 +430,60 @@ jobs:
           envs: 'PKGVERSION RAWVERSION'
           prepare: |
             pkg --version >/dev/null 2>&1 || ASSUME_ALWAYS_YES=yes pkg bootstrap -f
+            ASSUME_ALWAYS_YES=yes pkg install -y python3
           run: |
             set -e
             pkg --version
             pkg -vv | grep -i 'ABI' || true
             pkg create -v -f tzst -m meta -p meta/plist -r stage -o out
             ls -l out
+
+            # --- make the manifest readable by the pkg OPNsense ships -----------
+            # pkg >= 2.4 writes every file as {"sum":...,"uname":...,"perm":...,"mtime":...}.
+            # OPNsense 26.7 carries pkg 2.3.1, which does not know those keys: it logs
+            # "Skipping unknown key for file(...): sum", loses the checksum and then dies
+            # with SIGSEGV halfway through `pkg add`. The older flat layout
+            # ({path: "<sum>"}, {dir: "y"}) is understood by both, and ownership/mode ride
+            # along in the tar headers regardless. Rewrite in place, keeping every tar
+            # header untouched so root/wheel survives.
+            raw=$(ls out/sing-box-*.pkg)
+            zstd -d -q -f "$raw" -o /tmp/pkg.tar
+            python3 - /tmp/pkg.tar /tmp/pkg-flat.tar <<'PY'
+            import io, json, sys, tarfile
+
+            src, dst = sys.argv[1], sys.argv[2]
+            changed = False
+            with tarfile.open(src, "r:") as tin, tarfile.open(dst, "w:") as tout:
+                for member in tin:
+                    if member.name == "+MANIFEST" and member.isfile():
+                        body = tin.extractfile(member).read()
+                        data = json.loads(body)
+                        for key, empty in (("files", None), ("directories", "y")):
+                            section = data.get(key)
+                            if not isinstance(section, dict):
+                                continue
+                            for path, value in list(section.items()):
+                                if isinstance(value, dict):
+                                    section[path] = empty if empty else value.get("sum", "")
+                                    changed = True
+                        new = json.dumps(data, separators=(",", ":")).encode()
+                        member.size = len(new)
+                        tout.addfile(member, io.BytesIO(new))
+                    else:
+                        tout.addfile(member, tin.extractfile(member) if member.isfile() else None)
+            print("manifest flattened" if changed else "manifest already flat")
+
+            with tarfile.open(dst, "r:") as check:
+                manifest = json.loads(check.extractfile("+MANIFEST").read())
+                for key in ("files", "directories"):
+                    for path, value in (manifest.get(key) or {}).items():
+                        assert isinstance(value, str) and value, f"{key}:{path} still not flat"
+                assert manifest["scripts"]["post-install"], "post-install script lost"
+            print("manifest verified")
+            PY
+            zstd -q -19 -T0 -f /tmp/pkg-flat.tar -o "$raw"
+            ls -l out
+
             # Sanity: the package must be readable, installable and actually run.
             pkg info -F out/sing-box-*.pkg
             pkg add -f out/sing-box-*.pkg
