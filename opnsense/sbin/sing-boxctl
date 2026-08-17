@@ -1,0 +1,203 @@
+#!/bin/sh
+#
+# sing-boxctl — manage the sing-box service on OPNsense.
+#
+# OPNsense regenerates /etc/rc.conf on every boot, so the autostart flag lives in
+# /etc/rc.conf.d/sing_box, which survives. Everything else is a thin, predictable
+# wrapper around service(8) so that the same commands work from the shell and from
+# configd (see /usr/local/opnsense/service/conf/actions.d/actions_singbox.conf).
+
+set -e
+
+NAME="sing_box"
+RCCONF="/etc/rc.conf.d/${NAME}"
+RCSCRIPT="/usr/local/etc/rc.d/${NAME}"
+BIN="/usr/local/bin/sing-box"
+DEFAULT_CONFIG="/usr/local/etc/sing-box/config.json"
+DEFAULT_LOG="/var/log/sing-box/sing-box.log"
+DEFAULT_WORKDIR="/var/db/sing-box"
+PIDFILE="/var/run/sing_box.pid"
+
+usage()
+{
+    cat <<'USAGE'
+usage: sing-boxctl <command>
+
+  enable        start sing-box at boot (writes /etc/rc.conf.d/sing_box)
+  disable       do not start at boot; leaves a running instance alone
+  start         start now (works whether or not autostart is enabled)
+  stop          stop now
+  restart       stop and start
+  reload        validate the config, then SIGHUP the daemon (no downtime)
+  status        autostart flag, pid, version, config and the tail of the log
+  check         validate the config only
+  version       print the sing-box version banner
+  logs [-f] [n] show the last n log lines (default 50), -f to follow
+  config        print the effective paths
+USAGE
+}
+
+# sysrc(8) reads and writes the file for us, so a hand-edited rc.conf.d entry with
+# extra variables (sing_box_config, sing_box_flags, ...) is preserved.
+rc_get()
+{
+    if [ -f "${RCCONF}" ]; then
+        sysrc -f "${RCCONF}" -n "$1" 2>/dev/null || true
+    fi
+}
+
+config_path()
+{
+    value=$(rc_get sing_box_config)
+    [ -n "${value}" ] || value="${DEFAULT_CONFIG}"
+    printf '%s\n' "${value}"
+}
+
+log_path()
+{
+    value=$(rc_get sing_box_logfile)
+    if [ -z "${value}" ]; then
+        # A `log.output` in the config wins over the daemon(8) redirect, so look there
+        # before falling back to the packaged default.
+        value=$(sed -n 's/.*"output"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+            "$(config_path)" 2>/dev/null | head -n1)
+    fi
+    [ -n "${value}" ] || value="${DEFAULT_LOG}"
+    printf '%s\n' "${value}"
+}
+
+is_enabled()
+{
+    case "$(rc_get sing_box_enable)" in
+        [Yy][Ee][Ss]|[Tt][Rr][Uu][Ee]|[Oo][Nn]|1) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# service(8) refuses start/stop while the rcvar is NO, so fall back to the
+# one-prefixed forms. That keeps `start` meaningful before `enable`.
+rc_cmd()
+{
+    if is_enabled; then
+        service "${NAME}" "$1"
+    else
+        service "${NAME}" "one$1"
+    fi
+}
+
+# The pidfile is authoritative for a service-managed instance; the pgrep fallback also
+# finds an instance someone started by hand, which is exactly the case where "stopped"
+# would be a lie. sing-boxctl itself never matches: it has no " run" in its command line.
+running_pid()
+{
+    if [ -r "${PIDFILE}" ]; then
+        pid=$(cat "${PIDFILE}" 2>/dev/null)
+        if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
+            printf '%s\n' "${pid}"
+            return 0
+        fi
+    fi
+    pgrep -f 'sing-box .*run' 2>/dev/null | head -n1 || true
+}
+
+managed()
+{
+    [ -r "${PIDFILE}" ] && [ -n "$(cat "${PIDFILE}" 2>/dev/null)" ]
+}
+
+cmd_enable()
+{
+    mkdir -p "$(dirname "${RCCONF}")"
+    sysrc -f "${RCCONF}" sing_box_enable=YES > /dev/null
+    echo "autostart enabled (${RCCONF})"
+}
+
+cmd_disable()
+{
+    if [ -f "${RCCONF}" ]; then
+        sysrc -f "${RCCONF}" sing_box_enable=NO > /dev/null
+    else
+        mkdir -p "$(dirname "${RCCONF}")"
+        sysrc -f "${RCCONF}" sing_box_enable=NO > /dev/null
+    fi
+    echo "autostart disabled (${RCCONF}) - a running instance keeps going until 'stop'"
+}
+
+cmd_status()
+{
+    cfg=$(config_path)
+    pid=$(running_pid)
+    if is_enabled; then autostart="enabled"; else autostart="disabled"; fi
+    if [ -z "${pid}" ]; then
+        state="stopped"
+    elif managed; then
+        state="running (pid ${pid})"
+    else
+        state="running (pid ${pid}, started outside the service - 'restart' adopts it)"
+    fi
+
+    echo "service   : ${state}"
+    echo "autostart : ${autostart}"
+    echo "config    : ${cfg}"
+    echo "log       : $(log_path)"
+    if [ -x "${BIN}" ]; then
+        echo "version   : $("${BIN}" version 2>/dev/null | head -n1)"
+    else
+        echo "version   : ${BIN} is missing"
+    fi
+
+    log=$(log_path)
+    if [ -r "${log}" ]; then
+        echo "--- last log lines ---"
+        tail -n 5 "${log}"
+    fi
+    # A stopped service is a legitimate state, not an error - never exit non-zero here,
+    # or configd paints the whole action red.
+    return 0
+}
+
+cmd_logs()
+{
+    follow=""
+    lines=50
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -f) follow="-f" ;;
+            *[0-9]*) lines="$1" ;;
+        esac
+        shift
+    done
+    log=$(log_path)
+    [ -r "${log}" ] || { echo "no readable log at ${log}"; return 1; }
+    # shellcheck disable=SC2086
+    tail ${follow} -n "${lines}" "${log}"
+}
+
+cmd_config()
+{
+    echo "binary    : ${BIN}"
+    echo "rc script : ${RCSCRIPT}"
+    echo "rc.conf.d : ${RCCONF}"
+    echo "config    : $(config_path)"
+    echo "log       : $(log_path)"
+    workdir=$(rc_get sing_box_workdir)
+    [ -n "${workdir}" ] || workdir="${DEFAULT_WORKDIR}"
+    echo "workdir   : ${workdir}"
+    echo "pidfile   : ${PIDFILE}"
+}
+
+case "${1:-}" in
+    enable)   cmd_enable ;;
+    disable)  cmd_disable ;;
+    start)    rc_cmd start ;;
+    stop)     rc_cmd stop ;;
+    restart)  rc_cmd restart ;;
+    reload)   rc_cmd reload ;;
+    status)   cmd_status ;;
+    check)    rc_cmd configtest ;;
+    version)  "${BIN}" version ;;
+    logs)     shift; cmd_logs "$@" ;;
+    config)   cmd_config ;;
+    ""|-h|help|--help) usage ;;
+    *)        echo "unknown command: $1" >&2; usage >&2; exit 64 ;;
+esac

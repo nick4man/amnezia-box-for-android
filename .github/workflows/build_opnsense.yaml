@@ -230,6 +230,11 @@ jobs:
     if: ${{ github.event.inputs.make_pkg != 'false' && contains(github.event.inputs.goarches || 'amd64', 'amd64') }}
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout this repo (service files under opnsense/)
+        uses: actions/checkout@v4
+        with:
+          path: repo
+
       - name: Fetch the freebsd/amd64 binary
         uses: actions/download-artifact@v4
         with:
@@ -251,115 +256,36 @@ jobs:
           mkdir -p stage/var/db/sing-box && chmod 0700 stage/var/db/sing-box
           install -m 0755 "$bin" stage/usr/local/bin/sing-box
 
-          # ---- rc.d service ------------------------------------------------
-          cat > stage/usr/local/etc/rc.d/sing_box <<'RC'
-          #!/bin/sh
-          #
-          # PROVIDE: sing_box
-          # REQUIRE: LOGIN FILESYSTEMS defaultroute
-          # KEYWORD: shutdown
-          #
-          # sing_box_enable (bool):   Set to NO by default. YES to enable sing-box.
-          # sing_box_config (path):   Config file. Default /usr/local/etc/sing-box/config.json
-          # sing_box_workdir (path):  Working directory. Default /var/db/sing-box
-          # sing_box_flags (str):     Extra flags passed to `sing-box run`.
-
-          . /etc/rc.subr
-
-          name="sing_box"
-          rcvar="sing_box_enable"
-          desc="sing-box universal proxy platform (AmneziaWG)"
-
-          load_rc_config $name
-
-          : ${sing_box_enable:="NO"}
-          : ${sing_box_config:="/usr/local/etc/sing-box/config.json"}
-          : ${sing_box_workdir:="/var/db/sing-box"}
-          : ${sing_box_flags:=""}
-
-          pidfile="/var/run/${name}.pid"
-          procname="/usr/local/bin/sing-box"
-          command="/usr/sbin/daemon"
-          # -p (child pidfile) rather than -P: rc.subr matches the pid against
-          # ${procname}, so start/stop/status control sing-box itself, not daemon(8).
-          command_args="-f -p ${pidfile} -t ${name} ${procname} -D ${sing_box_workdir} -c ${sing_box_config} ${sing_box_flags} run"
-
-          start_precmd="sing_box_prestart"
-          sing_box_prestart()
-          {
-              if [ ! -f "${sing_box_config}" ]; then
-                  err 1 "${sing_box_config} does not exist - copy config.json.sample and edit it"
-              fi
-              /bin/mkdir -p "${sing_box_workdir}"
-              ${procname} check -c "${sing_box_config}" || err 1 "invalid config: ${sing_box_config}"
-          }
-
-          run_rc_command "$1"
-          RC
-          chmod 0755 stage/usr/local/etc/rc.d/sing_box
+          # ---- service files (kept in the repo under opnsense/) ------------
+          # rc.d script, the configd action set and the sing-boxctl wrapper live as real
+          # files so they can be reviewed and shell-checked outside this YAML.
+          mkdir -p stage/usr/local/sbin \
+                   stage/usr/local/opnsense/service/conf/actions.d
+          install -m 0755 repo/opnsense/rc.d/sing_box  stage/usr/local/etc/rc.d/sing_box
+          install -m 0755 repo/opnsense/sbin/sing-boxctl stage/usr/local/sbin/sing-boxctl
+          install -m 0644 repo/opnsense/actions.d/actions_singbox.conf \
+            stage/usr/local/opnsense/service/conf/actions.d/actions_singbox.conf
 
           # ---- sample config -----------------------------------------------
           # AWG is an *endpoint* type in the 1.14 core (option.AwgEndpointOptions):
           # peers[] instead of the flat 1.13 wireguard outbound, and h1..h4 are strings.
-          cat > stage/usr/local/etc/sing-box/config.json.sample <<'CFG'
-          {
-            "log": {
-              "level": "info",
-              "timestamp": true
-            },
-            "endpoints": [
-              {
-                "type": "awg",
-                "tag": "awg-ep",
-                "address": ["10.0.0.2/32"],
-                "private_key": "PRIVATE_KEY_BASE64",
-                "mtu": 1420,
-                "jc": 4,
-                "jmin": 40,
-                "jmax": 70,
-                "s1": 0,
-                "s2": 0,
-                "h1": "1",
-                "h2": "2",
-                "h3": "3",
-                "h4": "4",
-                "peers": [
-                  {
-                    "address": "1.2.3.4",
-                    "port": 51820,
-                    "public_key": "PEER_PUBLIC_KEY_BASE64",
-                    "allowed_ips": ["0.0.0.0/0"],
-                    "persistent_keepalive_interval": 25
-                  }
-                ]
-              }
-            ],
-            "inbounds": [
-              {
-                "type": "mixed",
-                "tag": "mixed-in",
-                "listen": "127.0.0.1",
-                "listen_port": 1080
-              }
-            ],
-            "outbounds": [
-              {
-                "type": "direct",
-                "tag": "direct"
-              }
-            ],
-            "route": {
-              "rules": [
-                {
-                  "ip_is_private": true,
-                  "outbound": "direct"
-                }
-              ],
-              "final": "awg-ep"
-            }
-          }
-          CFG
-          chmod 0600 stage/usr/local/etc/sing-box/config.json.sample
+          install -m 0600 repo/opnsense/etc/config.json.sample \
+            stage/usr/local/etc/sing-box/config.json.sample
+
+          # Fail loudly here rather than shipping a package with a broken script.
+          sh -n stage/usr/local/etc/rc.d/sing_box
+          sh -n stage/usr/local/sbin/sing-boxctl
+          python3 - <<'PY'
+          import configparser
+          cfg = configparser.ConfigParser(delimiters=(":",))
+          cfg.read("stage/usr/local/opnsense/service/conf/actions.d/actions_singbox.conf")
+          missing = {"start", "stop", "restart", "reload", "status"} - set(cfg.sections())
+          assert not missing, f"configd actions missing: {missing}"
+          for name in cfg.sections():
+              assert cfg[name].get("command"), f"[{name}] has no command"
+              assert cfg[name].get("type"), f"[{name}] has no type"
+          print("configd actions:", ", ".join(sorted(cfg.sections())))
+          PY
 
           # ---- plist (paths relative to prefix) -----------------------------
           # Only builtin keywords here: @sample lives in the ports tree
@@ -368,8 +294,10 @@ jobs:
           # Owners/modes are taken from the stage tree.
           cat > meta/plist <<'PLIST'
           bin/sing-box
+          sbin/sing-boxctl
           etc/rc.d/sing_box
           etc/sing-box/config.json.sample
+          opnsense/service/conf/actions.d/actions_singbox.conf
           @dir /var/db/sing-box
           PLIST
 
@@ -380,14 +308,24 @@ jobs:
           if [ ! -f "${cfg}" ]; then
               cp -p "${cfg}.sample" "${cfg}"
               echo "==> ${cfg} created from the sample. Edit it, then:"
-              echo "    echo 'sing_box_enable=YES' > /etc/rc.conf.d/sing_box"
-              echo "    service sing_box start"
+              echo "    sing-boxctl check && sing-boxctl enable && sing-boxctl start"
+          fi
+          # configd caches its action set at startup, so a fresh actions_singbox.conf
+          # only reaches `configctl` after a restart. Absent on plain FreeBSD.
+          if [ -x /usr/local/etc/rc.d/configd ]; then
+              service configd restart > /dev/null 2>&1 || true
+              echo "==> configctl singbox start|stop|restart|reload|status is available"
           fi
           POST
 
           cat > meta/+PRE_DEINSTALL <<'PRE'
           #!/bin/sh
           cfg=/usr/local/etc/sing-box/config.json
+          # Stop the service before its binary goes away; leave the autostart flag in
+          # /etc/rc.conf.d/sing_box alone so an upgrade does not silently disable it.
+          if [ -x /usr/local/sbin/sing-boxctl ]; then
+              /usr/local/sbin/sing-boxctl stop > /dev/null 2>&1 || true
+          fi
           # Remove the config only while it is still an untouched copy of the sample.
           if [ -f "${cfg}" ] && cmp -s "${cfg}" "${cfg}.sample"; then
               rm -f "${cfg}"
@@ -522,7 +460,43 @@ jobs:
             fi
             echo "daemon starts cleanly with a direct outbound present"
 
+            # --- the management layer -------------------------------------------
             test -x /usr/local/etc/rc.d/sing_box
+            test -x /usr/local/sbin/sing-boxctl
+            test -f /usr/local/opnsense/service/conf/actions.d/actions_singbox.conf
+
+            # Point the service at the keyed config instead of the placeholder one that
+            # +POST_INSTALL laid down; this also exercises the rc.conf.d override path.
+            sysrc -f /etc/rc.conf.d/sing_box sing_box_config=/tmp/awg-check.json > /dev/null
+            sing-boxctl config
+            sing-boxctl check
+
+            # Autostart flag round trip.
+            sing-boxctl enable
+            sysrc -f /etc/rc.conf.d/sing_box -n sing_box_enable | grep -qi '^yes$' \
+              || { echo "::error::enable did not set sing_box_enable"; exit 1; }
+            sing-boxctl status | grep -q 'autostart : enabled' \
+              || { echo "::error::status does not report the autostart flag"; exit 1; }
+
+            # Start / reload (SIGHUP, no downtime) / stop through the wrapper.
+            sing-boxctl start
+            sleep 4
+            sing-boxctl status | grep -q 'running (pid' \
+              || { echo "::error::service did not come up"; sing-boxctl status; exit 1; }
+            pid_before=$(cat /var/run/sing_box.pid)
+            sing-boxctl reload
+            sleep 3
+            pid_after=$(cat /var/run/sing_box.pid)
+            [ "$pid_before" = "$pid_after" ] \
+              || { echo "::error::reload restarted the process instead of SIGHUP"; exit 1; }
+            sing-boxctl stop
+            sleep 2
+            sing-boxctl status | grep -q 'service   : stopped' \
+              || { echo "::error::service did not stop"; sing-boxctl status; exit 1; }
+            sing-boxctl disable
+            rm -f /etc/rc.conf.d/sing_box
+            echo "sing-boxctl drives the service end to end"
+
             service sing_box status || true          # not enabled -> non-zero exit, that is expected
             pkg delete -y sing-box
             # +PRE_DEINSTALL drops the untouched config; the sample goes with the package.
