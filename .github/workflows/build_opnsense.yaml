@@ -117,6 +117,46 @@ jobs:
           go-version: '1.25.x'    # >= 1.25 required by the badlinkname / -checklinkname=0 tags
           cache-dependency-path: go.sum
 
+      - name: Patch the direct outbound for platforms without an interface monitor
+        run: |
+          set -e
+          # sing-tun has no NetworkUpdateMonitor outside linux/windows/darwin
+          # (monitor_other.go returns os.ErrInvalid), so route.NetworkManager keeps a nil
+          # interfaceMonitor. direct.Outbound.Start() calls InterfaceMonitor().MyInterfaces()
+          # unconditionally, so on FreeBSD every config carrying a `direct` outbound dies at
+          # startup with a SIGSEGV in fetchMyAddresses. Guard the call.
+          f=protocol/direct/outbound.go
+          [ -f "$f" ] || { echo "::notice::$f not present on this ref — nothing to patch"; exit 0; }
+          if grep -q 'interfaceMonitor := h.network.InterfaceMonitor()' "$f"; then
+            echo "already guarded upstream"
+            exit 0
+          fi
+          if ! grep -q 'h.network.InterfaceMonitor().MyInterfaces()' "$f"; then
+            echo "::notice::no unguarded InterfaceMonitor() call in $f — nothing to patch"
+            exit 0
+          fi
+          python3 - "$f" <<'PY'
+          import sys
+          path = sys.argv[1]
+          src = open(path).read()
+          old = "\tmyInterfaceNames := h.network.InterfaceMonitor().MyInterfaces()\n"
+          new = (
+              "\tif h.network == nil {\n\t\treturn\n\t}\n"
+              "\tinterfaceMonitor := h.network.InterfaceMonitor()\n"
+              "\tif interfaceMonitor == nil {\n"
+              "\t\t// No default interface monitor on this platform (FreeBSD and friends).\n"
+              "\t\treturn\n\t}\n"
+              "\tmyInterfaceNames := interfaceMonitor.MyInterfaces()\n"
+          )
+          assert src.count(old) == 1, "unexpected source layout"
+          open(path, "w").write(src.replace(old, new, 1))
+          print("patched", path)
+          PY
+          if gofmt -l "$f" | grep -q .; then
+            echo "::error::patch left $f unformatted"; gofmt -d "$f"; exit 1
+          fi
+          echo "PATCHED_DIRECT=1" >> "$GITHUB_ENV"
+
       - name: Build sing-box (with AmneziaWG)
         env:
           GOOS: freebsd
@@ -135,9 +175,12 @@ jobs:
           esac
           echo "build tags: $tags"
 
-          make build TAGS="$tags"
-          test -f sing-box
+          # `make` derives VERSION by running read_tag@latest off the network, and that
+          # helper chops the first character off a tag that does not start with "v" —
+          # 1.14.0-beta.14-awgm.10 shipped as ".14.0-beta.14-awgm.10". Pass it explicitly.
           ver=$(git describe --tags --always | sed 's/^v//')
+          make build TAGS="$tags" VERSION="$ver"
+          test -f sing-box
           out="sing-box-${ver}-freebsd-${GOARCH}"
           mv sing-box "$out"
           echo "VERSION=$ver" >> "$GITHUB_ENV"
@@ -299,7 +342,19 @@ jobs:
                 "listen_port": 1080
               }
             ],
+            "outbounds": [
+              {
+                "type": "direct",
+                "tag": "direct"
+              }
+            ],
             "route": {
+              "rules": [
+                {
+                  "ip_is_private": true,
+                  "outbound": "direct"
+                }
+              ],
               "final": "awg-ep"
             }
           }
@@ -398,6 +453,26 @@ jobs:
               /usr/local/etc/sing-box/config.json.sample > /tmp/awg-check.json
             /usr/local/bin/sing-box check -c /tmp/awg-check.json
             echo "sample config parses and the awg endpoint is live"
+
+            # Parsing is not enough: on FreeBSD the `direct` outbound used to panic in
+            # Start() because there is no interface monitor on this platform. Actually
+            # start the daemon and let it get past the outbound start stage.
+            /usr/local/bin/sing-box run -c /tmp/awg-check.json > /tmp/sing-box-run.log 2>&1 &
+            sbpid=$!
+            sleep 5
+            if ! kill -0 "$sbpid" 2>/dev/null; then
+              echo "::error::sing-box died during startup"; cat /tmp/sing-box-run.log; exit 1
+            fi
+            kill "$sbpid" 2>/dev/null || true
+            sleep 1
+            if grep -qi 'panic\|SIGSEGV' /tmp/sing-box-run.log; then
+              echo "::error::panic during startup"; cat /tmp/sing-box-run.log; exit 1
+            fi
+            if ! grep -q 'sing-box started' /tmp/sing-box-run.log; then
+              echo "::error::sing-box never reported a successful start"
+              cat /tmp/sing-box-run.log; exit 1
+            fi
+            echo "daemon starts cleanly with a direct outbound present"
 
             test -x /usr/local/etc/rc.d/sing_box
             service sing_box status || true          # not enabled -> non-zero exit, that is expected
