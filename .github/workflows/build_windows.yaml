@@ -6,10 +6,15 @@ name: Build sing-box (Windows, AmneziaWG)
 # so this workflow works no matter which repo it is placed in — it does NOT rely on
 # the surrounding repo containing the Makefile / cmd/sing-box.
 #
-# It reuses the core's own `make build`, so build tags, version (git describe) and
-# ldflags come straight from the Makefile. Default TAGS already include with_awg.
+# It reuses the core's own `make build`, so ldflags come straight from the Makefile.
+# Build tags are resolved per-ref and with_awg is appended when missing — the 1.12
+# line hardcodes it in the Makefile, but the 1.14 line reads
+# release/DEFAULT_BUILD_TAGS_OTHERS, which does NOT contain with_awg. Without this
+# the build silently produces the "Awg is not included in this build" stub.
+#
 # Pure-Go cross build (CGO_ENABLED=0); naive_outbound/cronet is intentionally omitted
-# (it would require the native libcronet via CGO).
+# (it would require the native libcronet via CGO), which is why the 1.14 line uses
+# DEFAULT_BUILD_TAGS_OTHERS rather than DEFAULT_BUILD_TAGS_WINDOWS.
 
 on:
   workflow_dispatch:
@@ -19,8 +24,8 @@ on:
         default: 'hoaxisr/amnezia-box'
         required: true
       core_ref:
-        description: 'core git ref (branch / tag / full 40-char SHA)'
-        default: 'main'
+        description: 'core git ref (branch / tag / full 40-char SHA). 1.12.12-awg = stable line, awg-1.14 = 1.14.0-beta line.'
+        default: '1.12.12-awg'
         required: true
       goarches:
         description: 'Comma-separated Windows architectures to build'
@@ -51,26 +56,69 @@ jobs:
       matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
     env:
       CORE_REPO: ${{ github.event.inputs.core_repo || 'hoaxisr/amnezia-box' }}
-      CORE_REF: ${{ github.event.inputs.core_ref || 'main' }}
+      CORE_REF: ${{ github.event.inputs.core_ref || '1.12.12-awg' }}
     steps:
+      - name: Resolve core ref
+        id: ref
+        run: |
+          set -e
+          # The core repo renames its AWG branch over time (main -> awg-1.14 -> ...),
+          # which fails the checkout outright. Fall back to the repo's own default
+          # branch instead of dying on a stale input.
+          url="https://github.com/${CORE_REPO}.git"
+          want="${CORE_REF}"
+          if printf '%s' "$want" | grep -Eq '^[0-9a-f]{40}$'; then
+            resolved="$want"                       # full SHA — ls-remote cannot list it
+          elif [ -n "$want" ] && git ls-remote --exit-code "$url" "refs/heads/$want" "refs/tags/$want" >/dev/null 2>&1; then
+            resolved="$want"
+          else
+            resolved=$(git ls-remote --symref "$url" HEAD | awk '/^ref:/{sub("refs/heads/","",$2); print $2; exit}')
+            [ -n "$resolved" ] || { echo "::error::cannot resolve any ref in $url"; exit 1; }
+            echo "::warning::core ref '${want}' not found in ${CORE_REPO} — using default branch '${resolved}'"
+          fi
+          echo "ref=$resolved" >> "$GITHUB_OUTPUT"
+          echo "core ${CORE_REPO}@${resolved}"
+
       - name: Checkout amnezia-box core
         uses: actions/checkout@v4
         with:
           repository: ${{ env.CORE_REPO }}
-          ref: ${{ env.CORE_REF }}
-          fetch-depth: 0          # Makefile derives VERSION from `git describe --tags`
+          ref: ${{ steps.ref.outputs.ref }}
+          fetch-depth: 0          # the version string comes from `git describe --tags`
           submodules: recursive
 
       - name: Sanity — this repo is the core
         run: |
-          test -f Makefile && test -d cmd/sing-box || {
-            echo "::error::core_repo '${CORE_REPO}@${CORE_REF}' has no Makefile/cmd/sing-box — wrong repo?"; exit 1; }
+          test -f Makefile && test -d cmd/sing-box && test -f include/awg.go || {
+            echo "::error::core_repo '${CORE_REPO}@${{ steps.ref.outputs.ref }}' is not an AWG-enabled sing-box core"; exit 1; }
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.25.x'    # >= 1.25 required by the badlinkname / -checklinkname=0 tags
+          go-version: '1.25.x'    # >= 1.25 required by the badlinkname / -checklinkname=0 tags on 1.14
           cache-dependency-path: go.sum
+
+      - name: Resolve build tags and version
+        run: |
+          set -e
+          # 1.14 keeps the tag list in release/*, 1.12 hardcodes it in the Makefile.
+          if [ -s release/DEFAULT_BUILD_TAGS_OTHERS ]; then
+            tags=$(tr -d '\r\n' < release/DEFAULT_BUILD_TAGS_OTHERS)
+          else
+            tags=$(sed -n 's/^TAGS[[:space:]]*?\{0,1\}=[[:space:]]*//p' Makefile | head -1 | tr -d '\r')
+          fi
+          [ -n "$tags" ] || { echo "::error::could not resolve build tags"; exit 1; }
+          case ",${tags}," in
+            *,with_awg,*) ;;
+            *) tags="${tags},with_awg" ;;         # 1.14's OTHERS list omits it
+          esac
+          # `make` derives VERSION by running read_tag@latest from the network; take it
+          # from the checkout instead so the build is self-contained and reproducible.
+          ver=$(git describe --tags --always | sed 's/^v//')
+          echo "TAGS=$tags" >> "$GITHUB_ENV"
+          echo "VERSION=$ver" >> "$GITHUB_ENV"
+          echo "tags   : $tags"
+          echo "version: $ver"
 
       - name: Build sing-box.exe (with AmneziaWG)
         env:
@@ -79,27 +127,32 @@ jobs:
           CGO_ENABLED: '0'
         run: |
           set -e
-          make build                       # TAGS already include with_awg
+          make build TAGS="$TAGS" VERSION="$VERSION"
           test -f sing-box.exe
-          ver=$(git describe --tags --always | sed 's/^v//')
-          out="sing-box-${ver}-windows-${GOARCH}.exe"
+          out="sing-box-${VERSION}-windows-${GOARCH}.exe"
           mv sing-box.exe "$out"
+          sha256sum "$out" > "${out}.sha256"
           echo "OUT=$out" >> "$GITHUB_ENV"
           echo "built $out"
 
-      - name: Verify AWG is compiled in
+      - name: Verify the binary
         run: |
           set -e
+          file "$OUT"
+          file "$OUT" | grep -q 'PE32+ executable' || { echo "::error::not a 64-bit PE binary"; exit 1; }
           if strings -n 8 "$OUT" | grep -q "Awg is not included in this build"; then
             echo "::error::AWG stub present — with_awg tag missing"; exit 1
           fi
           n=$(strings -n 6 "$OUT" | grep -ci 'amneziawg' || true)
           echo "amneziawg references: $n"
           [ "$n" -gt 0 ] || { echo "::error::no amneziawg symbols found"; exit 1; }
+          cat "${OUT}.sha256"
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
           name: sing-box-windows-${{ matrix.goarch }}
-          path: ${{ env.OUT }}
+          path: |
+            ${{ env.OUT }}
+            ${{ env.OUT }}.sha256
           if-no-files-found: error
